@@ -1,0 +1,138 @@
+---
+
+- name: Kopia zapasowa konfiguracji AdGuard
+  hosts: testowy
+  gather_facts: yes
+  become: true
+
+  vars:
+    ntfy_server: "http://192.168.0.55"
+    ntfy_topic: "ansible"
+    backup_retention_days: 7
+
+  tasks:
+    - block:
+        - name: Sprawdzenie czy plik konfiguracji istnieje
+          ansible.builtin.stat:
+            path: "/adguardhome/AdGuardHome/AdGuardHome.yaml"
+          register: adguard_dir_yaml
+
+        - name: Sprawdzenie czy katalog data istnieje
+          ansible.builtin.stat:
+            path: "/adguardhome/AdGuardHome/data"
+          register: adguard_dir_data
+
+        - name: Weryfikacja istnienia pików
+          ansible.builtin.assert:
+            that: adguard_dir_yaml.stat.exists or adguard_dir_data.stat.exists
+            fail_msg: "Nie znaleziono plików konfiguracji AdGuardHome do backupu"
+        
+        - name: Nazwę pliku backupu
+          ansible.builtin.set_fact:
+            backup_filename: "adguard_backup_{{ ansible_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+
+        - name: Tymczasowy katalog na backup
+          ansible.builtin.tempfile:
+            state:  directory
+            suffix: "_adguard_backup"
+          register: temp_backup_dir
+
+        - name: Stworzenie struktury katalogu
+          ansible.builtin.file:
+            path: "{{temp_backup_dir.path}}/AdGuardHome"
+            state: directory
+            mode: '0755'
+            
+        - name: Skopiowanie pliku yaml
+          ansible.builtin.copy:
+            src: "{{adguard_dir_yaml.stat.path}}"
+            dest: "{{temp_backup_dir.path}}/AdGuardHome/AdGuardHome.yaml"
+            remote_src: yes
+            mode: '0644'
+          when: adguard_dir_yaml.stat.exists
+
+        - name: Skopiowanie katalogu data
+          ansible.builtin.copy:
+            src: "{{adguard_dir_data.stat.path}}"
+            dest: "{{temp_backup_dir.path}}/AdGuardHome/data"
+            remote_src: yes
+            mode: '0755'
+          when: adguard_dir_data.stat.exists
+
+        - name: Stworzenie archiwum z backupem
+          community.general.archive:
+            path: "{{temp_backup_dir.path}}/AdGuardHome"
+            dest: "/tmp/{{backup_filename}}"
+            format: gz
+
+        - name: Stworzenie folderu do bakcupu na serwerze ansible
+          ansible.builtin.file:
+            path: "~/adguard-backup"
+            state: directory
+            mode: '0755'
+          delegate_to: master_ansible
+          become: false
+
+        - name: Sprawdzenie i instalacja rsync
+          ansible.builtin.package:
+            name: rsync
+            state: present
+          delegate_to: "{{item}}"
+          become: true
+          loop: 
+            - master_ansible
+            - "{{inventory_hostname}}"
+
+        - name: Skopiowanie pliku na serwer ansible
+          ansible.builtin.synchronize:
+            src: "/tmp/{{backup_filename}}"
+            dest: "/home/szymon/adguard-backup/"
+            mode: pull
+          delegate_to: master_ansible
+          become: false
+
+        - name: Usuń tymczasowy plik backup
+          ansible.builtin.file:
+            path: "/tmp/{{backup_filename}}"
+            state: absent
+
+        - name: Usuń tymczasowy folder backup
+          ansible.builtin.file:
+            path: "{{temp_backup_dir.path}}"
+            state: absent
+
+        - name: Znalezienie backupow do usunięcia
+          ansible.builtin.find:
+            paths: "~/adguard-backup"
+            patterns: "adguard_backup_{{ ansible_hostname }}_*.tar.gz"
+            age: "{{backup_retention_days}}d"
+            age_stamp: mtime
+          register: old_backups
+          delegate_to: master_ansible
+          become: false
+
+        - name: Usunięcie starych backupów
+          ansible.builtin.file:
+            path: "{{item.path}}"
+            state: absent
+          loop: "{{old_backups.files}}"
+          delegate_to: master_ansible
+          become: false
+          when: old_backups.files | length > 0
+
+      rescue:
+        - name: Powiadomienie do serwera ntfy o błędzie
+          ansible.builtin.uri:
+            url: "{{ntfy_server}}/{{ntfy_topic}}"
+            method: POST
+            headers:
+              Title: "Blad backupu - {{ ansible_hostname }}"
+            body: |
+              Host: {{ ansible_hostname }}
+              Blad podczas backupu AdGuardHome
+              
+              Szczegoly bledu:
+              {{ ansible_failed_result.msg | default('Nieznany błąd') }}
+              Playbook: Kopia zapasowa konfiguracji AdGuard
+          delegate_to: master_ansible
+          become: false

@@ -1,0 +1,155 @@
+---
+
+- name: Konfiguracja Windows Server
+  hosts: testowy
+  gather_facts: no
+
+  tasks:
+    - name: Sprawdzenie czy pula dyskowa istnieje
+      ansible.windows.win_powershell:
+        script: |
+           $pool = Get-StoragePool -FriendlyName "Pool_disk"
+           if ($pool) {
+              Write-Output "EXISTS"
+            } else {
+              Write-Output "NOT_EXISTS"
+            }
+      register: pool_check
+
+    - name: Znalezienie dysków do puli
+      ansible.windows.win_powershell:
+        script: Get-PhysicalDisk | Where-Object { $_.CanPool -eq $true } | Select-Object -ExpandProperty UniqueId | ConvertTo-Json
+      register: disks_to_pool
+      when: pool_check.output[0] == "NOT_EXISTS"
+
+    - name: Utworzenie puli dyskowej
+      ansible.windows.win_powershell:
+        script: |
+          $id = '{{ disks_to_pool.output[0] | replace("'", "''") }}'
+          $idps = $id | ConvertFrom-Json
+          $pd = $idps | ForEach-Object { Get-PhysicalDisk -UniqueId $_ }
+
+          if (-not (Get-StoragePool -FriendlyName "Pool_disk")) {
+            New-StoragePool -FriendlyName "Pool_disk" -StorageSubsystemFriendlyName (Get-StorageSubSystem).FriendlyName -PhysicalDisks $pd
+          }
+      when: disks_to_pool.output is defined
+
+    - name: Utworzenie tieru SSD
+      ansible.windows.win_powershell:
+        script: |
+          $ssd = Get-StoragePool -FriendlyName "Pool_disk" -ErrorAction Stop | Get-PhysicalDisk | Where-Object { $_.MediaType -eq "SSD" }
+          if ($ssd.Count -gt 0 -and -not (Get-StorageTier -FriendlyName "Pool_disk_SSD_Tier")) {
+            New-StorageTier -FriendlyName "Pool_disk_SSD_Tier" `
+                            -StoragePoolFriendlyName "Pool_disk" `
+                            -MediaType SSD `
+                            -ResiliencySettingName "Mirror" `
+                            -PhysicalDiskRedundancy 1
+          }
+      when: pool_check.output[0] == "EXISTS" or disks_to_pool.output is defined
+    
+    - name: Utworzenie tieru HDD
+      ansible.windows.win_powershell:
+        script: |
+          $hdd = Get-StoragePool -FriendlyName "Pool_disk" -ErrorAction Stop | Get-PhysicalDisk | Where-Object { $_.MediaType -eq "HDD" }
+          if ($hdd.Count -gt 0 -and -not (Get-StorageTier -FriendlyName "Pool_disk_HDD_Tier")) {
+            New-StorageTier -FriendlyName "Pool_disk_HDD_Tier" `
+                            -StoragePoolFriendlyName "Pool_disk" `
+                            -MediaType HDD `
+                            -ResiliencySettingName "Mirror" `
+                            -PhysicalDiskRedundancy 1
+          }
+      when: pool_check.output[0] == "EXISTS" or disks_to_pool.output is defined
+
+    - name: Utworzenie wirtualnego dysku
+      ansible.windows.win_powershell:
+        script: |
+          $pool = Get-StoragePool -FriendlyName "Pool_disk"
+          $ssdTier = Get-StorageTier -FriendlyName "Pool_disk_SSD_Tier"
+          $hddTier = Get-StorageTier -FriendlyName "Pool_disk_HDD_Tier"
+      
+          $ssdDisks = $pool | Get-PhysicalDisk | Where-Object { $_.MediaType -eq "SSD" }
+          $hddDisks = $pool | Get-PhysicalDisk | Where-Object { $_.MediaType -eq "HDD" }
+
+          $ssdSize = ($ssdDisks | Sort-Object Size | Select-Object -First 2 | Measure-Object -Property Size -Minimum).Minimum
+          $hddSize = ($hddDisks | Sort-Object Size | Select-Object -First 2 | Measure-Object -Property Size -Minimum).Minimum
+
+          $ssdSizeGB = [math]::Floor(($ssdSize * 0.75) / 1GB)
+          $hddSizeGB = [math]::Floor(($hddSize * 0.75) / 1GB)
+
+          New-VirtualDisk -StoragePoolFriendlyName "Pool_disk" `
+                          -FriendlyName "vd_pool_disk" `
+                          -StorageTiers @($ssdTier, $hddTier) `
+                          -StorageTierSizes @($($ssdSizeGB * 1GB), $($hddSizeGB * 1GB))
+
+    - name: Inicjalizacja
+      ansible.windows.win_powershell:
+        script: |
+          $disk = Get-VirtualDisk -FriendlyName "vd_pool_disk" | Get-Disk
+
+          if ($disk.PartitionStyle -eq "RAW") {
+            Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru
+          }
+
+          $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter:$false
+          Format-Volume -Partition $part -FileSystem ReFS -NewFileSystemLabel "Pool" -Confirm:$false
+          Set-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber -NewDriveLetter F
+
+    - name: Dodanie użytkowników
+      ansible.windows.win_user:
+        name: "{{ item.name }}"
+        fullname: "{{ item.fullname }}"
+        password: "{{ item.password }}"
+        state: present
+        password_never_expires: true
+        update_password: always
+      loop: 
+        - name: "MarekRomanek"
+          fullname: "Marek Romanek"
+          password: "Zaq12wsx"
+        - name: "JacekGula"
+          fullname: "Jacek Gula"
+          password: "Zaq12wsx"
+
+    - name: Utworzenie grupy zabezpieczeń
+      ansible.windows.win_group:
+        name: "Kierownicy"
+        state: present
+
+    - name: Dodanie użytkowników do grupy
+      ansible.windows.win_group_membership:
+        name: "Kierownicy"
+        members: "{{item}}"
+        state: present
+      loop: 
+        - "MarekRomanek"
+        - "JacekGula"
+
+    - name: Utworzenie katalogu Projekty
+      ansible.windows.win_file:
+        path: "F:\\Projekty"
+        state: directory
+
+    - name: Udostępnienie katalogu Projekty
+      ansible.windows.win_share:
+        name: "Projekty"
+        path: "F:\\Projekty"
+        list: false
+        full: Kierownicy,Administrators
+        state: present
+
+    - name: Instalacja 7zip, dig, firefox
+      ansible.windows.win_powershell:
+        script: |
+          winget install --id "{{ item }}" --silent --accept-package-agreements --accept-source-agreements
+      loop:
+        - "7zip.7zip"
+        - "ISC.Bind"
+        - "Mozilla.Firefox"
+
+    - name: Zapobieganie usuwania drukerek
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers
+        name: DisableDeletePrinter
+        data: 1
+        type: dword
+        state: present

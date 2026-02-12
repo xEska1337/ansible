@@ -1,0 +1,60 @@
+---
+
+- name: Aktualizacja pakietów
+  hosts: testowy
+  gather_facts: yes
+  become: true
+
+  vars:
+    apt_env:
+      DEBIAN_FRONTEND: noninteractive
+    ntfy_server: "http://192.168.0.55"
+    ntfy_topic: "ansible"
+
+  tasks:
+    - name: Ustawienie pliku dysku dla GRUB
+      ansible.builtin.shell: debconf-set-selections <<< "grub-pc grub-pc/install_devices multiselect /dev/sda"
+      args:
+        executable: /bin/bash
+      when: ansible_os_family == "Debian"
+
+    - block:
+        - name: test powiadomień
+          ansible.builtin.fail:
+            msg: "test powiadomień"
+          when: false
+
+        - name: Aktualizacja dla menadzera APT
+          environment: "{{apt_env}}"
+          ansible.builtin.apt:
+            update_cache: yes
+            upgrade: safe
+            autoremove: yes
+            autoclean: yes
+            dpkg_options: 'force-confdef,force-confold'
+          register: aptupgrade
+          when: ansible_os_family == "Debian"
+
+        - name: Stan po aktualzacji APT
+          ansible.builtin.debug:
+            msg: "{{aptupgrade.stdout_lines|last}}"
+          when: ansible_os_family == "Debian" and aptupgrade is succeeded
+      
+      rescue:
+        - name: Powiadomienie do serwera ntfy o błędzie
+          ansible.builtin.uri:
+            url: "{{ntfy_server}}/{{ntfy_topic}}"
+            method: POST
+            headers:
+              Title: "Blad aktualizacji - {{ ansible_hostname }}"
+            body: |
+              Host: {{ ansible_hostname }}
+              Blad podczas aktualizacji APT
+              
+              Szczegoly bledu:
+              {{ aptupgrade.msg | default(aptupgrade.stderr | default(aptupgrade.stdout | default('Nieznany blad'))) }}
+               
+              Playbook: Aktualizacja pakietow
+          when: ansible_os_family == "Debian"
+          delegate_to: localhost
+          become: false

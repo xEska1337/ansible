@@ -1,0 +1,195 @@
+---
+
+- name: Instalacja i Konfiguracja AdGuard Home
+  hosts: testowy
+  gather_facts: yes
+  become: true
+
+  tasks:
+    - name: Ustawienie motd
+      ansible.builtin.copy:
+        src: adguardmotd
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=r
+      tags: motd
+
+    - name: Sparwdzenie i doinstalowanie pakietu lvm2
+      ansible.builtin.apt:
+        name: lvm2
+        update_cache: yes
+
+    - name: Sprawdzenie czy istnieje już adg_lv
+      ansible.builtin.command: 
+        cmd: lvs adg_vg/adg_lv --noheadings -o lv_name
+      register: lv_check
+      changed_when: false
+      failed_when: false
+  
+    - name: Ustawienie zmiennej dotyczącej istnienia adg_lv
+      ansible.builtin.set_fact:
+        adg_lv_exists: "{{ lv_check.rc == 0 }}"
+
+    - name: Wyświetlenie status adg_lv
+      ansible.builtin.debug:
+        msg: "{{adg_lv_exists}}"
+
+    - name: Ustalenie dysków do raida
+      ansible.builtin.set_fact:
+        disks: |
+          {%- set disks_list = [] -%}
+          {%- for device in ansible_facts.devices -%}
+            {%- if ansible_facts.devices[device].partitions == {} and device is match('^sd|^vd|^nvme') and device not in (ansible_mounts | map(attribute='device') | map('regex_replace','/dev/','') | list) and ansible_facts.devices[device].holders == [] -%}
+              {%- set _ = disks_list.append('/dev/' ~ device) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ disks_list }}
+      when: not adg_lv_exists
+
+    - name: Sparwdzenie czy mamy 2 dyski
+      ansible.builtin.fail:
+        msg: " Potrzebne są dwa dyski do RAID1"
+      when: not adg_lv_exists and disks | length != 2
+
+    - name: Sparwdzenie rozmiaru dysków
+      ansible.builtin.set_fact:
+        same_size: |
+          {%- set first_size = ansible_facts.devices[disks[0].replace('/dev/', '')].size -%}
+          {%- set all_same = true -%}
+          {%- for disk in disks -%}
+            {%- if ansible_facts.devices[disk.replace('/dev/', '')].size != first_size -%}
+              {%- set all_same = false -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{all_same}}
+      when: not adg_lv_exists
+
+    - name: Sparwdzenie czy mają taki sam rozmiar
+      ansible.builtin.fail:
+        msg: Dyski muszą mieć taki sam rozmiar
+      when: not adg_lv_exists and not same_size
+
+    - name: Utworzenie woluminu fizycznego PV
+      community.general.lvm_pv:
+        device: "{{item}}"
+      loop: "{{disks}}"
+      when: not adg_lv_exists
+
+    - name: Utworzenie grupy woluminów VG
+      community.general.lvg:
+        vg: adg_vg
+        pvs: "{{disks}}"
+      when: not adg_lv_exists
+    
+    - name: Utworzenie woluminu logicznego lv
+      community.general.lvol:
+        vg: adg_vg
+        lv: adg_lv
+        size: +100%FREE
+        opts: "--type raid1 -m 1"
+      when: not adg_lv_exists
+
+    - name: Formatowanie na system plików ext4
+      community.general.filesystem:
+        fstype: ext4
+        dev: /dev/adg_vg/adg_lv
+      when: not adg_lv_exists
+
+    - name: Utworzenie katalogu montowania
+      ansible.builtin.file:
+        path: /adguardhome
+        state: directory
+        mode: '0755'
+    
+    - name: Montowanie woluminu
+      ansible.posix.mount:
+        path: /adguardhome
+        src: /dev/adg_vg/adg_lv
+        fstype: ext4
+        state: mounted
+
+    - name: Sparwdzenie czy AdGuard jest już zainstalowany
+      ansible.builtin.stat:
+        path: /etc/systemd/system/AdGuardHome.service
+      register: adguard_service
+
+    - name: Pobieranie AdGuard
+      ansible.builtin.get_url:
+        url: https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.69/AdGuardHome_linux_amd64.tar.gz
+        dest: /adguardhome/AdGuardHome_linux_amd64.tar.gz
+      when: not adguard_service.stat.exists
+
+    - name: Rozpakowanie AdGuard
+      ansible.builtin.unarchive:
+        src: /adguardhome/AdGuardHome_linux_amd64.tar.gz
+        remote_src: yes
+        dest: /adguardhome/
+      when: not adguard_service.stat.exists
+
+    - name: Usunięcie pobranego archiwum
+      ansible.builtin.file:
+        path: /adguardhome/AdGuardHome_linux_amd64.tar.gz
+        state: absent
+      when: not adguard_service.stat.exists
+
+    - name: Instalacja AdGuard
+      ansible.builtin.command:
+        cmd: ./AdGuardHome -s install
+        chdir: /adguardhome/AdGuardHome
+      when: not adguard_service.stat.exists
+
+    - name: Sparwdzenie i doinstalowanie ufw
+      ansible.builtin.apt:
+        name: ufw
+        update_cache: yes
+
+    - name: Ustawienie ufw - reset
+      ansible.builtin.command:
+        cmd: ufw --force reset
+      changed_when: false
+
+    - name: Ustawienie ufw - zezwól na połączenia wychodzące
+      community.general.ufw:
+        rule: allow
+        direction: "out"
+
+    - name: Ustawienie ufw - zezwól na SSH
+      community.general.ufw:
+        rule: allow
+        port: 22
+        proto: tcp
+
+    - name: Ustawienie ufw - zezwól na DNS
+      community.general.ufw:
+        rule: allow
+        port: 53
+        proto: '{{ item }}'
+      loop:
+        - tcp
+        - udp
+
+    - name: Ustawienie ufw - zezwól na panel AdGuard
+      community.general.ufw:
+        rule: allow
+        port: 3000
+        proto: tcp
+
+    - name: Ustawienie ufw - zablokuj połączenia przychodzące
+      community.general.ufw:
+        rule: deny
+        direction: "in"
+
+    - name: Ustawienie ufw - uruchom
+      community.general.ufw:
+        state: enabled
+
+    - name: Sprawdzenie statusu ufw
+      ansible.builtin.systemd:
+        name: ufw
+        enabled: yes
+      register: systemd_status
+
+    - name: Wyświetlenie statusu ufw
+      ansible.builtin.debug:
+        msg: "{{ systemd_status.enabled }}"
