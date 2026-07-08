@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+---
+
+- name: TrueNAS SCALE 25.10+ apps auto update
+  hosts: truenas
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Fetch all apps with available updates
+      ansible.builtin.shell: |
+        set -o pipefail
+        midclt call app.query | jq -r '.[] | select((.upgrade_available == true or .update_available == true) and .state == "RUNNING") | .id'
+      args:
+        executable: /bin/bash
+      register: raw_apps_to_update
+      changed_when: false
+
+    - name: Filter out blacklisted apps
+      ansible.builtin.set_fact:
+        final_apps_to_update: "{{ raw_apps_to_update.stdout_lines | difference(blacklisted_apps) }}"
+
+    - name: Process each app update individually
+      ansible.builtin.include_tasks: process-app-update.yaml
+      loop: "{{ final_apps_to_update }}"
+      loop_control:
+        loop_var: current_app
+      when: final_apps_to_update | length > 0

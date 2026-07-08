@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/tasks
+---
+- name: Attempt upgrade for {{ current_app }}
+  block:
+    - name: Trigger upgrade for {{ current_app }}
+      ansible.builtin.command: "midclt call app.upgrade '{{ current_app }}'"
+      register: upgrade_trigger
+      changed_when: upgrade_trigger.rc == 0
+
+    - name: Wait for upgrade job to complete
+      ansible.builtin.command: "midclt call core.get_jobs '[[\"id\", \"=\", {{ upgrade_trigger.stdout }}]]'"
+      register: job_info
+      until: (job_info.stdout | from_json)[0].state in ['SUCCESS', 'FAILED', 'ABORTED']
+      retries: 50
+      delay: 10
+      changed_when: false
+
+    - name: Verify job success
+      ansible.builtin.fail:
+        msg: "{{ (job_info.stdout | from_json)[0].error }}"
+      when: (job_info.stdout | from_json)[0].state != 'SUCCESS'
+
+    - name: Log successful upgrade
+      ansible.builtin.debug:
+        msg: "Successfully upgraded {{ current_app }}!"
+
+  rescue:
+    - name: WARNING - Upgrade failed for {{ current_app }}
+      ansible.builtin.debug:
+        msg: "Upgrade failed for {{ current_app }}."
+
+    - name: Ensure the original container is started
+      ansible.builtin.command: "midclt call app.start '{{ current_app }}'"
+      register: start_output
+      changed_when: start_output.rc == 0
+      failed_when: false
+
+    - name: Send failure notification to ntfy server
+      ansible.builtin.uri:
+        url: "{{ ntfy_server }}/{{ ntfy_topic }}"
+        method: POST
+        headers:
+          Title: "App Update Failed: {{ current_app }}"
+          Priority: "high"
+          Tags: "warning"
+        body: |
+          Host: {{ inventory_hostname }}
+          Application: {{ current_app }}
+          
+          The TrueNAS application failed to upgrade. 
+          The system has aborted the update and rest original coarted thentainer version to keep your services online.
+          
+          Error Details:
+          {{ ansible_failed_result.msg | default('Unknown middleware error. Check TrueNAS UI.') }}
+          
+          Playbook: TrueNAS App Auto-Update
+        status_code: [200, 204]
+      failed_when: false
