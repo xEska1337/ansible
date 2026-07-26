@@ -35,24 +35,24 @@
       changed_when: start_output.rc == 0
       failed_when: false
 
-    - name: Send failure notification to ntfy server
+    - name: Send failure notification to Gotify server
       ansible.builtin.uri:
-        url: "{{ ntfy_server }}/{{ ntfy_topic }}"
+        url: "{{ gotify_server }}/message?token={{ gotify_token }}"
         method: POST
-        headers:
-          Title: "App Update Failed: {{ current_app }}"
-          Priority: "high"
-          Tags: "warning"
-        body: |
-          Host: {{ inventory_hostname }}
-          Application: {{ current_app }}
-          
-          The TrueNAS application failed to upgrade. 
-          The system has aborted the update and rest original coarted thentainer version to keep your services online.
-          
-          Error Details:
-          {{ ansible_failed_result.msg | default('Unknown middleware error. Check TrueNAS UI.') }}
-          
-          Playbook: TrueNAS App Auto-Update
-        status_code: [200, 204]
+        body_format: json
+        body:
+          title: "App Update Failed: {{ current_app }}"
+          priority: 5
+          message: |
+            Host: {{ inventory_hostname }}
+            Application: {{ current_app }}
+            
+            The TrueNAS application failed to upgrade. 
+            The system has aborted the update and restored the original container version to keep your services online.
+            
+            Error Details:
+            {{ ansible_failed_result.msg | default('Unknown middleware error. Check TrueNAS UI.') }}
+            
+            Playbook: TrueNAS App Auto-Update
+        status_code: [200]
       failed_when: false
