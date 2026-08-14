@@ -1,0 +1,123 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+---
+
+- name: Install Docker with Docker Compose
+  hosts: all
+  gather_facts: false
+  become: true
+
+  pre_tasks:
+    - name: Bootstrap Python on Alpine
+      ansible.builtin.raw: if [ -x /sbin/apk ] && ! command -v python3 >/dev/null 2>&1; then apk update && apk add --no-cache python3; fi
+      changed_when: false
+
+    - name: Gather facts for all hosts
+      ansible.builtin.setup:
+
+  tasks:
+    - name: Debian
+      when: ansible_os_family == "Debian"
+      block:
+        - name: Update APT package cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install prerequisites
+          ansible.builtin.apt:
+            name:
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - gnupg
+              - lsb-release
+            state: present
+
+        - name: Create directory for Docker keyrings
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        - name: Add Docker GPG key
+          ansible.builtin.get_url:
+            url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+            dest: /etc/apt/keyrings/docker.asc
+            mode: '0644'
+
+        - name: Add Docker APT repository
+          ansible.builtin.apt_repository:
+            repo: >-
+              deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }} signed-by=/etc/apt/keyrings/docker.asc]
+              https://download.docker.com/linux/{{ ansible_distribution | lower }}
+              {{ ansible_distribution_release }} stable
+            state: present
+
+        - name: Install Docker packages
+          ansible.builtin.apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+
+
+    - name: Fedora
+      when: ansible_os_family == "RedHat"
+      block:
+        - name: Install dnf-plugins-core
+          ansible.builtin.dnf:
+            name: dnf-plugins-core
+            state: present
+
+        - name: Add Docker repository
+          ansible.builtin.get_url:
+            url: https://download.docker.com/linux/fedora/docker-ce.repo
+            dest: /etc/yum.repos.d/docker-ce.repo
+            mode: '0644'
+          when: ansible_distribution == "Fedora"
+
+        - name: Add Docker repository
+          ansible.builtin.get_url:
+            url: https://download.docker.com/linux/centos/docker-ce.repo
+            dest: /etc/yum.repos.d/docker-ce.repo
+            mode: '0644'
+          when: ansible_distribution != "Fedora"
+
+        - name: Install Docker packages
+          ansible.builtin.dnf:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+
+
+    - name: Alpine
+      when: ansible_os_family == "Alpine"
+      block:
+        - name: Install Docker and Docker Compose plugin
+          community.general.apk:
+            name:
+              - docker
+              - docker-cli-compose
+            state: present
+            update_cache: true
+
+
+    - name: Ensure Docker service is started and enabled on boot
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add current user to docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+      when: ansible_user is defined
