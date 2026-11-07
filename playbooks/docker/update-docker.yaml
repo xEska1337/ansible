@@ -1,0 +1,108 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+---
+- name: Autonomous Docker Compose Updater
+  hosts: "docker_hosts:!docker_hosts_excluded"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Ensure state directory exists
+      ansible.builtin.file:
+        path: "{{ state_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Check Docker Compose availability
+      ansible.builtin.command:
+        cmd: docker compose version
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Skip hosts without Docker Compose
+      ansible.builtin.meta: end_host
+      when: docker_check.rc != 0
+
+    - name: Discover all Docker Compose projects
+      ansible.builtin.command:
+        cmd: docker compose ls --all --format json
+      register: compose_ls
+      changed_when: false
+
+    - name: Skip hosts with no compose projects
+      ansible.builtin.meta: end_host
+      when: (compose_ls.stdout | from_json) | length == 0
+
+    - name: Set project list
+      ansible.builtin.set_fact:
+        compose_projects: "{{ compose_ls.stdout | from_json }}"
+
+    - name: Render resolved Compose config for each project
+      ansible.builtin.command:
+        cmd: "docker compose -f {{ item.ConfigFiles }} config --format json"
+      loop: "{{ compose_projects }}"
+      loop_control:
+        label: "{{ item.Name }}"
+      register: project_render_results
+      changed_when: false
+
+    - name: Update each project
+      ansible.builtin.include_tasks: tasks/update_project.yaml
+      loop: "{{ project_render_results.results }}"
+      loop_control:
+        loop_var: project_render
+        label: "{{ project_render.item.Name }}"
+      when: project_render.rc == 0
+
+- name: Docker cleanup (preserve rollback targets)
+  hosts: "docker_hosts:!docker_hosts_excluded"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check Docker availability
+      ansible.builtin.command:
+        cmd: docker version --format '{{ '{{' }}.Server.Version{{ '}}' }}'
+      register: docker_cleanup_check
+      changed_when: false
+      failed_when: false
+
+    - name: Skip hosts without Docker
+      ansible.builtin.meta: end_host
+      when: docker_cleanup_check.rc != 0
+
+    - name: Prune unused images older than retention window
+      ansible.builtin.command:
+        cmd: >-
+          docker image prune -a -f
+          --filter "until={{ image_retention_hours }}h"
+      register: prune_images
+      changed_when: "'deleted' in prune_images.stdout"
+
+    - name: Count reclaimed images
+      ansible.builtin.set_fact:
+        pruned_image_count: >-
+          {{ prune_images.stdout_lines | select('search', 'deleted') | list | length }}
+
+    - name: Report image cleanup
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: pruned {{ pruned_image_count }} image(s)
+          (retention {{ image_retention_hours }}h)
+
+    - name: Prune unused volumes older than retention window
+      ansible.builtin.command:
+        cmd: >-
+          docker volume prune -a -f
+          --filter "until={{ volume_retention_hours }}h"
+      register: prune_volumes_result
+      changed_when: "'deleted' in prune_volumes_result.stdout"
+      when: prune_volumes | bool
+
+    - name: Prune unused build cache
+      ansible.builtin.command:
+        cmd: >-
+          docker builder prune -f
+          --filter "until={{ image_retention_hours }}h"
+      register: prune_builder
+      changed_when: "'deleted' in prune_builder.stdout"

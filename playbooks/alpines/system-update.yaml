@@ -1,0 +1,201 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+---
+- name: Alpine LXC Auto-Update with Docker Health Checks
+  hosts: alpines
+  gather_facts: false
+  become: true
+
+  pre_tasks:
+    - name: Bootstrap Python for Ansible
+      ansible.builtin.raw: apk update && apk add --no-cache python3
+      changed_when: false
+
+    - name: Gather facts now that Python is installed
+      ansible.builtin.setup:
+
+  tasks:
+    - name: Alpine update
+      block:
+        - name: Verify Docker was already healthy before we start
+          ansible.builtin.command:
+            cmd: docker info --format '{{ "{{" }}.ServerVersion{{ "}}" }}'
+          register: docker_pre
+          changed_when: false
+          failed_when: false
+
+        - name: Abort if Docker was already unhealthy before playbook start
+          ansible.builtin.fail:
+            msg: >-
+              Docker was already broken on {{ inventory_hostname }} before
+              this playbook started (rc={{ docker_pre.rc }}).
+              This is leftover shim corruption from a previous apk upgrade
+              or manual `rc-service docker restart`. Recover it first:
+                rc-service docker stop && rc-service containerd stop
+                rm -rf /var/run/docker/containerd/shim/*
+                rc-service containerd start && rc-service docker start
+          when: docker_pre.rc != 0
+
+        - name: Record currently running Docker containers
+          ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+          register: pre_update_containers
+          changed_when: false
+          failed_when: false
+
+        - name: Update package cache and upgrade all packages
+          community.general.apk:
+            update_cache: true
+            upgrade: true
+          register: apk_upgrade
+          when: ansible_os_family == "Alpine"
+
+        - name: Detect whether docker or containerd was upgraded
+          ansible.builtin.set_fact:
+            docker_upgraded: >-
+              {{
+                (apk_upgrade.packages | default([]))
+                | select('match', '^(docker|containerd)(-|$)')
+                | list | length > 0
+              }}
+          when: apk_upgrade is changed
+
+        - name: Controlled Docker restart with shim cleanup
+          ansible.builtin.shell:
+            cmd: |
+              set -e
+              rc-service docker stop || true
+              rc-service containerd stop || true
+              rm -rf /var/run/docker/containerd/shim/* 2>/dev/null || true
+              rm -rf /var/run/docker/containerd/daemon/io.containerd.runtime.v2.task/* 2>/dev/null || true
+              rc-service containerd start
+              rc-service docker start
+          when: docker_upgraded | default(false)
+
+        - name: Verify Docker can actually create containers (not just respond)
+          ansible.builtin.shell:
+            cmd: |
+              set -e
+              img=$(docker ps -q | head -1 | xargs -r docker inspect --format '{{ "{{" }}.Config.Image{{ "}}" }}')
+              if [ -z "$img" ]; then
+                echo "no running containers; falling back to alpine:latest"
+                img="alpine:latest"
+              fi
+              docker create --name ansible-shim-probe "$img" true >/dev/null
+              docker rm ansible-shim-probe >/dev/null
+          register: shim_probe
+          until: shim_probe.rc == 0
+          retries: 6
+          delay: 5
+          changed_when: false
+          failed_when: false
+          when: docker_pre.rc == 0
+
+        - name: Fail if Docker cannot create containers after upgrade
+          ansible.builtin.fail:
+            msg: >-
+              Docker responds but cannot create containers on
+              {{ inventory_hostname }} after apk upgrade. This is containerd
+              shim corruption. The controlled restart did not recover it —
+              manual intervention is required.
+          when:
+            - docker_pre.rc == 0
+            - shim_probe.rc is defined
+            - shim_probe.rc != 0
+
+        - name: Determine whether a kernel package was changed
+          ansible.builtin.set_fact:
+            kernel_changed: >-
+              {{
+                (apk_upgrade.packages | default([]))
+                | select('match', '^linux-')
+                | list
+                | length > 0
+              }}
+          when: apk_upgrade is changed
+
+        - name: Restart container to apply kernel updates
+          ansible.builtin.reboot:
+            msg: "Ansible: Rebooting container to apply kernel updates"
+            connect_timeout: 5
+            reboot_timeout: 120
+          when:
+            - ansible_os_family == "Alpine"
+            - kernel_changed | default(false)
+            - allow_reboot | bool
+
+        - name: Notify that a reboot is required but suppressed
+          ansible.builtin.uri:
+            url: "{{ gotify_server_direct | default(gotify_server) }}/message?token={{ gotify_token }}"
+            method: POST
+            body_format: json
+            body:
+              title: "Reboot Required - {{ inventory_hostname }}"
+              message: |
+                Host: {{ inventory_hostname }}
+                A kernel package was upgraded, but allow_reboot is false.
+                Reboot manually when convenient.
+
+                Playbook: Alpine LXC Auto-Update
+              priority: 5
+            status_code: [200]
+          delegate_to: localhost
+          become: false
+          failed_when: false
+          when:
+            - ansible_os_family == "Alpine"
+            - kernel_changed | default(false)
+            - not (allow_reboot | bool)
+
+        - name: Wait for Docker service to be ready
+          ansible.builtin.command: docker info
+          register: docker_info
+          until: docker_info.rc == 0
+          retries: 12
+          delay: 5
+          changed_when: false
+          when: pre_update_containers.rc == 0 and pre_update_containers.stdout_lines | length > 0
+
+        - name: Verify running Docker containers
+          ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+          register: post_update_containers
+          changed_when: false
+          when: pre_update_containers.rc == 0 and pre_update_containers.stdout_lines | length > 0
+
+        - name: Fail if any containers did not recover
+          ansible.builtin.fail:
+            msg: >
+              Docker containers failed to start after update:
+              {{ pre_update_containers.stdout_lines | difference(post_update_containers.stdout_lines) | join(', ') }}
+          when:
+            - pre_update_containers.rc == 0
+            - pre_update_containers.stdout_lines | length > 0
+            - (pre_update_containers.stdout_lines | difference(post_update_containers.stdout_lines)) | length > 0
+
+        - name: Log successful state
+          ansible.builtin.debug:
+            msg: >-
+              Successfully updated {{ inventory_hostname }}.
+              Docker shim verified, container creation works,
+              {{ pre_update_containers.stdout_lines | length }} container(s) still healthy.
+          when: ansible_os_family == "Alpine"
+
+      rescue:
+        - name: Send failure notification to Gotify server
+          ansible.builtin.uri:
+            url: "{{ gotify_server_direct | default(gotify_server) }}/message?token={{ gotify_token }}"
+            method: POST
+            body_format: json
+            body:
+              title: "Update Error - {{ inventory_hostname }}"
+              message: |
+                Host: {{ inventory_hostname }}
+                Failed to update or verify the Alpine LXC container.
+
+                Error Details:
+                {{ ansible_failed_result.msg | default(apk_upgrade.msg | default('Unknown error occurred')) }}
+
+                Playbook: Alpine LXC Auto-Update
+              priority: 8
+            status_code: [200]
+          delegate_to: localhost
+          become: false
+          failed_when: false

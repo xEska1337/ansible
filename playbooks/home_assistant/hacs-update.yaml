@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+---
+- name: Home Assistant HACS Auto-Update
+  hosts: home_assistant_01
+  gather_facts: false
+  
+  tasks:
+    - name: Fetch available HACS updates via HA API
+      ansible.builtin.uri:
+        url: "{{ ha_url }}/api/template"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ ha_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          template: "{% raw %}{{ states.update | selectattr('state', 'eq', 'on') | map(attribute='entity_id') | join(',') }}{% endraw %}"
+        return_content: true
+      register: pending_updates
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Handle HACS installation and safety warnings
+      when: pending_updates.content != ""
+      block:
+        - name: Trigger installation of pending HACS updates
+          ansible.builtin.uri:
+            url: "{{ ha_url }}/api/services/update/install"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ ha_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              entity_id: "{{ pending_updates.content }}"
+            timeout: 300
+          delegate_to: localhost
+          register: hacs_install
+          changed_when: true
+      
+      rescue:
+        - name: Send failure notification to Gotify server
+          ansible.builtin.uri:
+            url: "{{ gotify_server }}/message?token={{ gotify_token }}"
+            method: POST
+            body_format: json
+            body:
+              title: "Update Error - {{ inventory_hostname }}"
+              message: |
+                Host: {{ inventory_hostname }}
+                Failed to update Home Assistant HACS components.
+
+                Error Details:
+                Marketplace warning requires manual acknowledgment in the HA UI.
+                {{ ansible_failed_result.msg | default('Unknown error occurred') }}
+
+                Playbook: Home Assistant HACS Auto-Update
+              priority: 8
+            status_code: [200]
+          delegate_to: localhost
+          become: false
+          failed_when: false
+          
+        - name: Gracefully halt playbook
+          ansible.builtin.meta: end_play
+
+    - name: Restart Home Assistant Core to apply HACS changes
+      ansible.builtin.raw: ha core restart
+      when: 
+        - pending_updates.content != ""
+        - hacs_install is defined
+        - hacs_install.changed
+      changed_when: true

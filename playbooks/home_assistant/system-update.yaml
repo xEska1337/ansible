@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+---
+- name: Home Assistant Native Auto-Update
+  hosts: home_assistant_01
+  gather_facts: false
+  
+  tasks:
+    - name: Create a full Home Assistant backup
+      ansible.builtin.raw: ha backups new --name "Pre-Ansible Native Update"
+      register: ha_backup
+      changed_when: true
+      when: 0 > 1
+
+    - name: Update Home Assistant Core
+      ansible.builtin.raw: ha core update
+      register: core_update
+      changed_when: "'Processing' in core_update.stdout"
+      failed_when: false
+
+    - name: Update Home Assistant OS
+      ansible.builtin.raw: ha os update
+      register: os_update
+      changed_when: "'Processing' in os_update.stdout"
+      failed_when: false
+
+    - name: Check for available Add-on updates
+      ansible.builtin.raw: ha apps --raw-json | jq -r '.data.addons[] | select(.update_available==true and .slug!="core_ssh") | .slug'
+      register: addon_updates
+      changed_when: false
+      failed_when: false
+
+    - name: Update Home Assistant Add-ons
+      ansible.builtin.raw: "ha apps update {{ item }}"
+      loop: "{{ addon_updates.stdout_lines }}"
+      when: 
+        - addon_updates.stdout_lines | length > 0
+        - "' ' not in item"
+      changed_when: true
+
+    - name: Reboot Home Assistant Host to apply OS updates
+      ansible.builtin.raw: ha host reboot
+      when: os_update.changed
+      failed_when: false
+      changed_when: true
+
+    - name: Wait for Home Assistant to reboot and SSH to return
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: 22
+        state: started
+        delay: 15
+        timeout: 600
+      delegate_to: localhost
+      become: false
+      when: os_update.changed

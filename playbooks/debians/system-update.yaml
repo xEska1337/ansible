@@ -1,0 +1,144 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook
+---
+- name: Debian LXC Auto-Update with Docker Health Checks
+  hosts: debians
+  gather_facts: false
+  become: true
+
+  pre_tasks:
+    - name: Ensure Python and apt bindings are present
+      ansible.builtin.raw: |
+        command -v python3 >/dev/null 2>&1 || apt-get update && apt-get install -y python3
+        dpkg -s python3-apt >/dev/null 2>&1 || apt-get install -y python3-apt
+      changed_when: false
+
+    - name: Gather facts now that Python is available
+      ansible.builtin.setup:
+
+    - name: Ensure needrestart is installed for reboot detection
+      ansible.builtin.apt:
+        name: needrestart
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+  tasks:
+    - name: Debian update
+      block:
+        - name: Record currently running Docker containers
+          ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+          register: pre_update_containers
+          changed_when: false
+          failed_when: false
+
+        - name: Update package cache and upgrade all packages
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+            upgrade: dist
+            autoremove: true
+            autoclean: true
+            force_apt_get: true
+            dpkg_options: "force-confdef,force-confold"
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+            NEEDRESTART_MODE: a
+          register: apt_upgrade
+          when: ansible_os_family == "Debian"
+
+        - name: Check whether a reboot is required
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+            get_checksum: false
+          register: reboot_required_file
+
+        - name: Restart host to apply core updates
+          ansible.builtin.reboot:
+            msg: "Ansible: Rebooting to apply Debian updates"
+            connect_timeout: 5
+            reboot_timeout: 180
+          when:
+            - ansible_os_family == "Debian"
+            - apt_upgrade.changed
+            - reboot_required_file.stat.exists
+            - allow_reboot | bool
+
+        - name: Notify that a reboot is required but suppressed
+          ansible.builtin.uri:
+            url: "{{ gotify_server }}/message?token={{ gotify_token }}"
+            method: POST
+            body_format: json
+            body:
+              title: "Reboot Required - {{ ansible_hostname }}"
+              message: |
+                Host: {{ inventory_hostname }}
+                A reboot is required to complete Debian updates, but allow_reboot is false.
+
+                Recommended action:
+                Reboot this host manually when convenient. Until then, running
+                kernel and library binaries may be out of sync with their
+                on-disk counterparts.
+
+                Playbook: Debian LXC Auto-Update
+              priority: 5
+            status_code: [200]
+          delegate_to: localhost
+          become: false
+          failed_when: false
+          when:
+            - ansible_os_family == "Debian"
+            - apt_upgrade.changed
+            - reboot_required_file.stat.exists
+            - not (allow_reboot | bool)
+
+        - name: Wait for Docker service to be ready
+          ansible.builtin.command: docker info
+          register: docker_info
+          until: docker_info.rc == 0
+          retries: 12
+          delay: 5
+          changed_when: false
+          when: pre_update_containers.rc == 0 and pre_update_containers.stdout_lines | length > 0
+
+        - name: Verify running Docker containers
+          ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+          register: post_update_containers
+          changed_when: false
+          when: pre_update_containers.rc == 0 and pre_update_containers.stdout_lines | length > 0
+
+        - name: Fail if any containers did not recover
+          ansible.builtin.fail:
+            msg: >
+              Docker containers failed to start after update:
+              {{ pre_update_containers.stdout_lines | difference(post_update_containers.stdout_lines) | join(', ') }}
+          when:
+            - pre_update_containers.rc == 0
+            - pre_update_containers.stdout_lines | length > 0
+            - (pre_update_containers.stdout_lines | difference(post_update_containers.stdout_lines)) | length > 0
+
+        - name: Log successful state
+          ansible.builtin.debug:
+            msg: "Successfully updated {{ ansible_hostname }}. All services healthy."
+          when: ansible_os_family == "Debian"
+
+      rescue:
+        - name: Send failure notification to Gotify server
+          ansible.builtin.uri:
+            url: "{{ gotify_server }}/message?token={{ gotify_token }}"
+            method: POST
+            body_format: json
+            body:
+              title: "Update Error - {{ ansible_hostname }}"
+              message: |
+                Host: {{ inventory_hostname }}
+                Failed to update or verify the Debian LXC container.
+
+                Error Details:
+                {{ ansible_failed_result.msg | default(apt_upgrade.msg | default('Unknown error occurred')) }}
+
+                Playbook: Debian LXC Auto-Update
+              priority: 8
+            status_code: [200]
+          delegate_to: localhost
+          become: false
+          failed_when: false

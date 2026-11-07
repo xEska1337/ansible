@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/tasks
+---
+- name: Set project facts
+  ansible.builtin.set_fact:
+    project_name: "{{ project_render.item.Name }}"
+    compose_file_args: >-
+      {{
+        project_render.item.ConfigFiles.split(',')
+        | map('regex_replace', '^', '-f ') | join(' ')
+      }}
+    project_dir: "{{ project_render.item.ConfigFiles.split(',')[0] | dirname }}"
+    project_config: "{{ project_render.stdout | from_json }}"
+
+- name: Enumerate services with a static image
+  ansible.builtin.set_fact:
+    updateable_services: >-
+      {{
+        project_config.services | dict2items
+        | selectattr('value.image', 'defined')
+        | rejectattr('value.image', 'equalto', '')
+        | map(attribute='key') | list
+      }}
+
+- name: Update each service in project
+  ansible.builtin.include_tasks: tasks/update_service.yaml
+  loop: "{{ updateable_services }}"
+  loop_control:
+    loop_var: svc_name
+    label: "{{ project_name }}/{{ svc_name }}"

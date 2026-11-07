@@ -1,0 +1,208 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/tasks
+---
+- name: Set service facts
+  ansible.builtin.set_fact:
+    service_image: "{{ project_config.services[svc_name].image }}"
+    version_file: >-
+      {{ state_dir }}/{{ project_dir | regex_replace('[^a-zA-Z0-9]', '_') }}-{{ svc_name }}.json
+
+- name: Pre-flight health check
+  ansible.builtin.include_tasks: tasks/healthcheck.yaml
+
+- name: Notify and abort when service was already unhealthy
+  when: not service_healthy
+  block:
+    - name: Send pre-flight failure notification
+      ansible.builtin.uri:
+        url: "{{ gotify_server }}/message?token={{ gotify_token }}"
+        method: POST
+        body_format: json
+        body:
+          title: "Pre-flight Failed - {{ inventory_hostname }}/{{ svc_name }}"
+          message: |
+            Host: {{ inventory_hostname }}
+            Project: {{ project_name }}
+            Service: {{ svc_name }}
+            Status: {{ health_detail }}
+
+            Service was already unhealthy before update. Aborting to preserve
+            a valid rollback target. Manual investigation required.
+          priority: 8
+        status_code: [200]
+      delegate_to: localhost
+      become: false
+      failed_when: false
+
+    - name: Abort update for {{ svc_name }}
+      ansible.builtin.fail:
+        msg: "{{ svc_name }} was already unhealthy ({{ health_detail }}); update aborted."
+
+- name: Pull new image and deploy with rollback
+  block:
+    - name: Pull target image
+      ansible.builtin.command:
+        cmd: docker pull {{ service_image }}
+      register: pull_result
+      changed_when: "'Downloaded newer image' in pull_result.stdout"
+
+    - name: Get pulled image ID
+      ansible.builtin.command:
+        cmd: "docker image inspect --format '{{ '{{' }}.Id{{ '}}' }}' {{ service_image }}"
+      register: pulled_image_id
+      changed_when: false
+
+    - name: Get current running container image ID
+      ansible.builtin.command:
+        cmd: "docker inspect --format '{{ '{{' }}.Image{{ '}}' }}' {{ hc_cid.stdout }}"
+      register: running_image_id
+      changed_when: false
+      when: hc_cid.stdout | length > 0
+
+    - name: Decide whether a redeploy is needed
+      ansible.builtin.set_fact:
+        needs_update: >-
+          {{
+            hc_cid.stdout | length == 0
+            or running_image_id.stdout | default('') != pulled_image_id.stdout
+          }}
+        rollback_digest: >-
+          {{ running_image_id.stdout | default('none') }}
+
+    - name: Report no-op
+      ansible.builtin.debug:
+        msg: "{{ svc_name }} already running {{ service_image }}; no change."
+      when: not needs_update
+
+    - name: Recreate container with new image
+      ansible.builtin.command:
+        cmd: >-
+          docker compose {{ compose_file_args }}
+          up -d --no-deps --force-recreate --pull never {{ svc_name }}
+      register: recreate
+      when: needs_update
+
+    - name: Post-deploy health check
+      ansible.builtin.include_tasks: tasks/healthcheck.yaml
+      when: needs_update
+
+    - name: Fail if post-deploy health check did not pass
+      ansible.builtin.fail:
+        msg: "{{ svc_name }} unhealthy after deploy: {{ health_detail }}"
+      when:
+        - needs_update
+        - not service_healthy
+
+    - name: Persist successful deployment
+      ansible.builtin.copy:
+        content: |
+          {{
+            {
+              'service': svc_name,
+              'project': project_name,
+              'image_ref': service_image,
+              'image_digest': pulled_image_id.stdout,
+              'deployed_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+              'status': 'healthy'
+            } | to_nice_json
+          }}
+        dest: "{{ version_file }}"
+        mode: "0644"
+      when: needs_update
+
+  rescue:
+    - name: Notify rollback started
+      ansible.builtin.uri:
+        url: "{{ gotify_server }}/message?token={{ gotify_token }}"
+        method: POST
+        body_format: json
+        body:
+          title: "Rollback Started - {{ inventory_hostname }}/{{ svc_name }}"
+          message: |
+            Host: {{ inventory_hostname }}
+            Project: {{ project_name }}
+            Service: {{ svc_name }}
+            New image: {{ service_image }}
+            Failure: {{ health_detail }}
+
+            Rolling back to {{ rollback_digest }}.
+          priority: 7
+        status_code: [200]
+      delegate_to: localhost
+      become: false
+      failed_when: false
+
+    - name: Abort rollback when no previous image exists
+      ansible.builtin.fail:
+        msg: >-
+          {{ svc_name }} has no previous image to roll back to
+          (first deploy or container never started).
+      when: rollback_digest | default('none') == 'none'
+
+    - name: Reconstruct immutable rollback reference
+      ansible.builtin.set_fact:
+        rollback_ref: "{{ (service_image | regex_replace(':[^:/]+$', '')) ~ '@' ~ rollback_digest }}"
+
+    - name: Write rollback compose override
+      ansible.builtin.copy:
+        content: |
+          services:
+            {{ svc_name }}:
+              image: "{{ rollback_ref }}"
+        dest: "{{ project_dir }}/.rollback-{{ svc_name }}.yml"
+        mode: "0644"
+
+    - name: Recreate container with previous image
+      ansible.builtin.command:
+        cmd: >-
+          docker compose {{ compose_file_args }}
+          -f .rollback-{{ svc_name }}.yml
+          up -d --no-deps --force-recreate --pull never {{ svc_name }}
+        chdir: "{{ project_dir }}"
+
+    - name: Remove rollback override
+      ansible.builtin.file:
+        path: "{{ project_dir }}/.rollback-{{ svc_name }}.yml"
+        state: absent
+
+    - name: Verify rollback health
+      ansible.builtin.include_tasks: tasks/healthcheck.yaml
+
+    - name: Persist rollback state
+      ansible.builtin.copy:
+        content: |
+          {{
+            {
+              'service': svc_name,
+              'project': project_name,
+              'image_ref': rollback_ref,
+              'image_digest': rollback_digest,
+              'rolled_back_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+              'rolled_back_from': service_image,
+              'status': ('rolled_back' if service_healthy else 'rollback_failed')
+            } | to_nice_json
+          }}
+        dest: "{{ version_file }}"
+        mode: "0644"
+
+    - name: Notify rollback outcome
+      ansible.builtin.uri:
+        url: "{{ gotify_server }}/message?token={{ gotify_token }}"
+        method: POST
+        body_format: json
+        body:
+          title: >-
+            Rollback {{ 'OK' if service_healthy else 'FAILED' }}
+            - {{ inventory_hostname }}/{{ svc_name }}
+          message: |
+            Host: {{ inventory_hostname }}
+            Project: {{ project_name }}
+            Service: {{ svc_name }}
+            Rolled back {{ service_image }} → {{ rollback_ref }}
+            Health: {{ health_detail }}
+            {{ 'Rollback successful.' if service_healthy
+               else 'ROLLBACK FAILED — manual intervention required.' }}
+          priority: "{{ 8 if service_healthy else 10 }}"
+        status_code: [200]
+      delegate_to: localhost
+      become: false
+      failed_when: false

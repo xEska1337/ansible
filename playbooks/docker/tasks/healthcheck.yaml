@@ -1,0 +1,79 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/tasks
+---
+- name: Find container for {{ svc_name }}
+  ansible.builtin.command:
+    cmd: "docker compose {{ compose_file_args }} ps -q {{ svc_name }}"
+  register: hc_cid
+  changed_when: false
+
+- name: Initialize health state
+  ansible.builtin.set_fact:
+    service_healthy: false
+    health_detail: "no running container"
+
+- name: Detect native Docker healthcheck presence
+  ansible.builtin.command:
+    cmd: >-
+      docker inspect --format
+      '{{ '{{' }}if .State.Health{{ '}}' }}yes{{ '{{' }}else{{ '}}' }}no{{ '{{' }}end{{ '}}' }}'
+      {{ hc_cid.stdout }}
+  register: hc_has
+  changed_when: false
+  failed_when: false
+  when: hc_cid.stdout | length > 0
+
+- name: Wait for Docker-native health status
+  ansible.builtin.command:
+    cmd: >-
+      docker inspect --format '{{ '{{' }}.State.Health.Status{{ '}}' }}'
+      {{ hc_cid.stdout }}
+  register: hc_docker
+  until: hc_docker.stdout == "healthy"
+  retries: "{{ health_retries }}"
+  delay: "{{ health_delay }}"
+  failed_when: false
+  changed_when: false
+  when:
+    - hc_cid.stdout | length > 0
+    - hc_has.stdout | default('') == 'yes'
+
+- name: Mark healthy from native Docker healthcheck
+  ansible.builtin.set_fact:
+    service_healthy: true
+    health_detail: "docker-native healthcheck"
+  when:
+    - hc_docker is defined
+    - hc_docker.stdout | default('') == 'healthy'
+
+- name: Record failed native healthcheck result
+  ansible.builtin.set_fact:
+    health_detail: "docker-native healthcheck reported: {{ hc_docker.stdout | default('unknown') }}"
+  when:
+    - hc_has.stdout | default('') == 'yes'
+    - hc_docker is defined
+    - hc_docker.stdout | default('') != 'healthy'
+
+- name: Wait for container to reach running state
+  ansible.builtin.command:
+    cmd: >-
+      docker inspect --format '{{ '{{' }}.State.Status{{ '}}' }}'
+      {{ hc_cid.stdout }}
+  register: hc_state
+  until: hc_state.stdout == "running"
+  retries: "{{ health_retries }}"
+  delay: "{{ health_delay }}"
+  failed_when: false
+  changed_when: false
+  when:
+    - hc_cid.stdout | length > 0
+    - not service_healthy
+    - hc_has.stdout | default('') == 'no'
+
+- name: Mark healthy from running fallback
+  ansible.builtin.set_fact:
+    service_healthy: true
+    health_detail: "container running (no native healthcheck defined)"
+  when:
+    - not service_healthy
+    - hc_state is defined
+    - hc_state.stdout | default('') == 'running'
